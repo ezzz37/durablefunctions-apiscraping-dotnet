@@ -45,6 +45,83 @@ namespace FanOutFanInCrawler
             return client.CreateCheckStatusResponse(req, instanceId);
         }
 
+    public static async Task CleanOldRepositoryData([ActivityTrigger] IDurableActivityContext context, ILogger log)
+        {
+            // Obtiene el número de días a retener desde la entrada de la función de actividad.
+            // Si no se proporciona o es inválido, por defecto retendrá datos de los últimos 90 días.
+            int daysToRetain = context.GetInput<int>();
+            if (daysToRetain <= 0)
+            {
+                daysToRetain = 90; // Valor por defecto
+            }
+
+            log.LogInformation($"Iniciando limpieza de datos de repositorio. Se eliminarán entradas anteriores a los últimos {daysToRetain} días.");
+
+            var client = account.CreateCloudTableClient();
+            var table = client.GetTableReference("Repositories");
+
+            // Asegurarse de que la tabla exista antes de intentar consultarla.
+            if (!await table.ExistsAsync())
+            {
+                log.LogWarning("La tabla 'Repositories' no existe. No hay datos que limpiar.");
+                return;
+            }
+
+            // Calcular la fecha límite: cualquier entrada anterior a esta fecha será eliminada.
+            DateTimeOffset cutoffDate = DateTimeOffset.UtcNow.AddDays(-daysToRetain);
+
+            TableQuery<Repository> query = new TableQuery<Repository>();
+            TableContinuationToken continuationToken = null;
+            var entitiesToDelete = new List<Repository>();
+
+            // Iterar sobre todos los segmentos de la tabla para encontrar entidades a eliminar.
+            do
+            {
+                TableQuerySegment<Repository> segment = await table.ExecuteQuerySegmentedAsync(query, continuationToken);
+                continuationToken = segment.ContinuationToken;
+
+                // Filtrar las entidades que son más antiguas que la fecha de corte.
+                entitiesToDelete.AddRange(segment.Results.Where(e => e.Timestamp < cutoffDate));
+
+            } while (continuationToken != null);
+
+            if (entitiesToDelete.Any())
+            {
+                log.LogInformation($"Encontradas {entitiesToDelete.Count} entradas de repositorio para eliminar.");
+
+                // Eliminar entidades en lotes de 100 (límite de Table Storage para operaciones por lotes).
+                // Asegúrate de que el método de extensión .Chunk() esté disponible (requiere .NET 6+ o la implementación manual a continuación).
+                var batches = entitiesToDelete.Chunk(100);
+                int deletedCount = 0;
+
+                foreach (var batch in batches)
+                {
+                    TableBatchOperation batchOperation = new TableBatchOperation();
+                    foreach (var entity in batch)
+                    {
+                        batchOperation.Delete(entity);
+                    }
+                    try
+                    {
+                        await table.ExecuteBatchAsync(batchOperation);
+                        deletedCount += batch.Count();
+                        log.LogInformation($"Eliminado un lote de {batch.Count()} entradas.");
+                    }
+                    catch (StorageException ex)
+                    {
+                        log.LogError($"Error al eliminar un lote de entradas: {ex.Message}");
+                        // Considera añadir lógica de reintento o manejo de errores aquí.
+                    }
+                }
+                log.LogInformation($"Limpieza de datos completada. Total de entradas eliminadas: {deletedCount}");
+            }
+            else
+            {
+                log.LogInformation("No se encontraron entradas de repositorio antiguas para eliminar.");
+            }
+        }
+            
+
         [FunctionName("Orchestrator")]
         public static async Task<string> RunOrchestrator(
             [OrchestrationTrigger] IDurableOrchestrationContext context)
